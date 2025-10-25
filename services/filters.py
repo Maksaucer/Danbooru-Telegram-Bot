@@ -3,13 +3,17 @@ from database.filters import get_filters, add_filter, remove_filter
 
 async def get_filters_inline_keyboard(user_id: int) -> InlineKeyboardMarkup:
     filters = await get_filters(user_id)
-    nsfw_status = "✅ ВКЛ" if "nsfw" in filters else "❌ ВЫКЛ"
-    male_status = "✅ ВКЛ" if "gay" in filters else "❌ ВЫКЛ"
+    nsfw_status = "✅ ОТОБРАЖАЕТСЯ" if "nsfw" in filters else "❌ НЕ ОТОБРАЖАЕТСЯ"
+    sfw_status = "✅ ОТОБРАЖАЕТСЯ" if "sfw" in filters else "❌ НЕ ОТОБРАЖАЕТСЯ"
+    male_status = "✅ ОТОБРАЖАЕТСЯ" if "gay" in filters else "❌ НЕ ОТОБРАЖАЕТСЯ"
     return InlineKeyboardMarkup(
-        inline_keyboard=[[
+        inline_keyboard=[
+            [
             InlineKeyboardButton(text=f"🚫 NSFW: {nsfw_status}", callback_data="toggle_nsfw"),
+            InlineKeyboardButton(text=f"🚫 SFW: {sfw_status}", callback_data="toggle_sfw"),
             InlineKeyboardButton(text=f"🚫 GAY: {male_status}", callback_data="toggle_gay"),
-        ]]
+            ]
+        ]
     )
 
 def get_rating_label(rating: str) -> str:
@@ -47,30 +51,24 @@ def is_post_allowed(post: dict, filters: list[str]) -> bool:
     fset = {f.lower() for f in (filters or [])}
     allowed_ext = {"jpg", "jpeg", "png", "gif", "webp", "mp4", "webm"}
 
-    # 0) формат
     if _extract_ext(post) not in allowed_ext:
         return False
 
-    # 1) теги
     tags = _extract_tags_set(post)
 
-    # 2) жёсткие баны
-    if {"gore", "feces", "urine"} & tags:
+    if {"gore", "feces", "urine", "diaper", "pregnant"} & tags:
         return False
 
-    if not fset:
-        return True
+    if "sfw" in fset:
+        if (post.get("rating") or "").lower() == "s":
+            return False
+    elif "nsfw" in fset:
+        if (post.get("rating") or "").lower() in {"e", "q"}:
+            return False
 
-    # 3) рейтинг: при включённом фильтре nsfw отсекаем явный NSFW (e/q)
-    rating = (post.get("rating") or "").lower()
-    if "nsfw" in fset and rating in {"e", "q"}:
+    if ("gay" in fset) and ("1girl" not in tags):
         return False
 
-    # 4) грубая эвристика против male-only при фильтре "gay"
-    if "gay" in fset and ("1boy" in tags and "1girl" not in tags):
-        return False
-
-    # 5) пользовательские минус‑теги (если вдруг хранишь реальные теги в filters)
     if fset & tags:
         return False
 

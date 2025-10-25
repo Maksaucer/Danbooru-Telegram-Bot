@@ -17,7 +17,7 @@ from config import (
 from parsers.gelbooru import fetch_by_tags
 from services.filters import is_post_allowed
 
-HARD_BAN_TAGS = {"gore", "feces", "urine"}
+HARD_BAN_TAGS = {"gore", "feces", "urine", "loli", "shota"}
 
 def _period_threshold(period: str) -> datetime:
     now = datetime.now()
@@ -37,17 +37,40 @@ def _parse_created_at(s: str | None) -> datetime | None:
             continue
     return None
 
-def build_query_tags(user_filters: List[str], random_order: bool) -> List[str]:
+def _date_window(period: str) -> tuple[str, str]:
+    # используем UTC, чтобы совпадать с сервером
+    now = datetime.utcnow().date()
+    if period == "day":
+        start = now - timedelta(days=1)
+    elif period == "week":
+        start = now - timedelta(days=7)
+    elif period == "month":
+        start = now - timedelta(days=30)
+    else:
+        start = now - timedelta(days=3650)
+    return start.isoformat(), now.isoformat()
+
+def _date_tag_variants(period: str) -> list[list[str]]:
+    # два варианта синтаксиса на случай различий
+    start, end = _date_window(period)
+    return [
+        [f"date:{start}..{end}"],                 # диапазон
+        [f"date:>={start}", f"date:<={end}"],     # >= и <=
+    ]
+
+def build_query_tags(user_filters: List[str], random_order: bool, period: str | None = None) -> List[str]:
     tags: List[str] = []
-    tags += [f"-{t}" for t in sorted({"gore","feces","urine"})]
+    tags += [f"-{t}" for t in sorted(HARD_BAN_TAGS)]
     fset = {f.lower() for f in user_filters}
 
-    # ТОЛЬКО пользовательский фильтр управляет SFW
-    if "nsfw" in fset:
-        tags.append("rating:safe")
+    # Взаимоисключающие режимы
+    if "sfw" in fset:
+        tags.append("-rating:safe")   # оставить только NSFW
+    elif "nsfw" in fset:
+        tags.append("rating:safe")    # оставить только SFW
 
     if "gay" in fset:
-        tags += ["-1boy", "1girl"]
+        tags += ["-yaoi", "trap"]
 
     tags.append("sort:random" if random_order else "sort:score")
     return tags
@@ -101,29 +124,33 @@ class Cache:
         return buf
 
     async def _refill(self, buf: Buffer, user_filters: List[str], period: str, random_order: bool) -> None:
-        tags = build_query_tags(user_filters, random_order=random_order)
+        base = build_query_tags(user_filters, random_order=random_order)
 
-        # RANDOM: одной страницы обычно хватает
+        # RANDOM: одной страницы обычно достаточно
         if random_order:
             await self._rate_limit()
-            raw = await fetch_by_tags(tags, limit=self.refill_size)
+            raw = await fetch_by_tags(base, limit=self.refill_size)
             filtered = [p for p in raw if is_post_allowed(p, user_filters)]
             logging.info(
                 "cache refill: got=%d, after_filter=%d, random=%s, period=%s, tags=%s",
-                len(raw), len(filtered), random_order, period, " ".join(tags)
+                len(raw), len(filtered), random_order, period, " ".join(base)
             )
             buf.put_all(filtered)
             return
 
-        # TOP BY PERIOD: постранично собираем свежие посты
+        # TOP BY PERIOD: сортировка по дате + постраничный обход без server-side date
+        # убираем старую sort:* и ставим sort:date
+        tags_top = [t for t in base if not t.startswith("sort:")]
+        tags_top.append("sort:date")
+
         thr = _period_threshold(period)
         collected: List[dict] = []
         pid = 0
-        page_limit = max(1, CACHE_MAX_PAGES)
+        page_limit = max(1, CACHE_MAX_PAGES)  # возьми из config, по умолчанию 6
 
         while len(collected) < self.refill_size and pid < page_limit:
             await self._rate_limit()
-            raw = await fetch_by_tags(tags, limit=min(self.refill_size, 100), pid=pid)
+            raw = await fetch_by_tags(tags_top, limit=min(self.refill_size, 100), pid=pid)
             if not raw:
                 break
 
@@ -131,8 +158,8 @@ class Cache:
                 if not is_post_allowed(p, user_filters):
                     continue
                 dt = _parse_created_at(p.get("created_at"))
-                # если дата не распарсилась — пропускаем (чтобы «день/неделя» были честными)
-                if not dt or dt < thr:
+                # если дата распарсилась и старше порога — пропускаем; если даты нет — оставляем
+                if dt is not None and dt < thr:
                     continue
                 collected.append(p)
                 if len(collected) >= self.refill_size:
@@ -142,8 +169,20 @@ class Cache:
 
         logging.info(
             "cache refill (TOP): pages=%d, collected=%d/%d, period=%s, tags=%s",
-            pid, len(collected), self.refill_size, period, " ".join(tags)
+            pid, len(collected), self.refill_size, period, " ".join(tags_top)
         )
+
+        # Мягкий фолбек, чтобы не оставлять пользователя без ответа
+        if not collected:
+            await self._rate_limit()
+            tags_fallback = build_query_tags(user_filters, random_order=True)
+            raw = await fetch_by_tags(tags_fallback, limit=self.refill_size)
+            collected = [p for p in raw if is_post_allowed(p, user_filters)]
+            logging.info(
+                "cache refill (fallback RANDOM): got=%d, after_filter=%d, period=%s, tags=%s",
+                len(raw), len(collected), period, " ".join(tags_fallback)
+            )
+
         buf.put_all(collected)
 
     async def get_post(self, user_filters: List[str], period: str = "week", random_order: bool = True) -> dict | None:
